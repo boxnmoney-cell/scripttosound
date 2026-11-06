@@ -5,6 +5,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from studio.config import OPENAI_MODEL
 from studio.models import Analysis, Event, Review, Script, Segment
 from studio.pipeline import translate, write_script
 from studio.profiles import PROFILES
@@ -74,8 +75,8 @@ def test_provider_cache_and_schema(tmp_path):
                                         "usage": {"total_tokens": 22}})
     api = Providers("test-secret", transport=httpx.MockTransport(handler))
     for _ in range(2):
-        assert api.structured("model-a", "rules", "facts", Review, tmp_path).issues == []
-    api.structured("model-b", "rules", "facts", Review, tmp_path)
+        assert api.structured(OPENAI_MODEL, "rules", "facts", Review, tmp_path).issues == []
+    api.structured(OPENAI_MODEL, "updated rules", "facts", Review, tmp_path)
     assert len(calls) == 2
     assert all("test-secret" not in f.read_text() for f in tmp_path.glob("*.json"))
     api.close()
@@ -84,8 +85,17 @@ def test_provider_cache_and_schema(tmp_path):
 def test_api_errors_do_not_echo_secrets():
     api = Providers("secret", transport=httpx.MockTransport(lambda r: httpx.Response(401, text="secret")))
     with pytest.raises(APIError) as error:
-        api.structured("m", "s", "c", Review)
+        api.structured(OPENAI_MODEL, "s", "c", Review)
     assert "secret" not in str(error.value)
+    api.close()
+
+
+def test_only_luna_can_be_sent_to_openai():
+    calls = []
+    api = Providers("test", transport=httpx.MockTransport(lambda r: calls.append(r)))
+    with pytest.raises(ValueError, match="только модель gpt-6-luna"):
+        api.structured("gpt-5.5", "rules", "facts", Review)
+    assert not calls
     api.close()
 
 

@@ -8,6 +8,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from studio import media
+from studio.config import ANALYSIS_BATCH_SIZE, FRAME_RATE, OPENAI_MODEL, analysis_settings
 from studio.models import Analysis, LANGUAGES, PerformanceSettings, Profile, Script
 from studio.pipeline import analyze, direct_script, review, translate, write_script
 from studio.performance import EMOTIONS, INTENSITIES, POSITIONS, automatic_audio_tags, speech_window, tts_text, voice_fingerprint
@@ -76,8 +77,9 @@ def main():
         with st.expander("Ключи и модели"):
             openai_key = st.text_input("OpenAI API key", value=os.getenv("OPENAI_API_KEY", ""), type="password")
             eleven_key = st.text_input("ElevenLabs API key", value=os.getenv("ELEVENLABS_API_KEY", ""), type="password")
-            vision_model = st.text_input("Модель анализа", value=os.getenv("OPENAI_VISION_MODEL", "gpt-5.5"))
-            text_model = st.text_input("Модель текста", value=os.getenv("OPENAI_TEXT_MODEL", "gpt-5.5"))
+            st.text_input("Модель анализа и текста", value=OPENAI_MODEL, disabled=True)
+            vision_model = text_model = OPENAI_MODEL
+            st.caption("GPT-6 Luna используется для анализа, сценария, перевода и эмоций. Старые настройки модели в .env не применяются.")
             st.caption("Ключи из полей используются только в текущей сессии. Для постоянной настройки заполните локальный .env.")
         api = Providers(openai_key, eleven_key)
         voice_prefs = prefs.get("voices", {}).get(voice_language, {})
@@ -181,19 +183,21 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
         st.text(COMMON_RULES)
 
     st.subheader("1. События видео")
-    quality = st.selectbox("Подробность", ["Обычный анализ", "Подробный анализ"])
-    st.caption("До 240 основных кадров и дополнительные кадры начала и финала. Ключевые события между кадрами могут остаться нераспознанными.")
+    expected_count = len(media.sample_times(info.duration))
+    batch_count = (expected_count + ANALYSIS_BATCH_SIZE - 1) // ANALYSIS_BATCH_SIZE
+    st.info(f"{FRAME_RATE} кадров/с по всему видео: {expected_count} кадров. Сначала извлекаются все JPEG, затем отправляются в GPT-6 Luna.")
+    st.caption(f"Шаг 0,2 секунды. Без кэша: {batch_count} запросов анализа и 1 проверка финала. Видео и исходный звук модели не отправляются.")
     if st.button("Проанализировать видео", disabled=not api.openai_key, type="primary"):
         status = st.empty()
         try:
             with st.spinner("Извлекаю и анализирую кадры…"):
-                sampled = media.frames(video, directory / "frames", info.duration, fps=1 if quality == "Обычный анализ" else 2)
-                sampled += media.frames(video, directory / "frames", info.duration, fps=3, end=min(3, info.duration))
-                sampled += media.frames(video, directory / "frames", info.duration, fps=4, start=max(0, info.duration - 5))
-                sampled = sorted({f["time"]: f for f in sampled}.values(), key=lambda f: f["time"])
+                sampled = media.frames(video, directory / "frames", info.duration)
+                status.info(f"Извлечено {len(sampled)} из {expected_count} кадров. Передаю изображения в {OPENAI_MODEL}…")
                 result = analyze(api, profile, sampled, info.duration, vision_model, cache, status.info)
             state["analysis"] = result.model_dump()
             state["analysis_profile"] = digest(profile.model_dump())
+            state["analysis_settings"] = analysis_settings()
+            state["analysis_frame_count"] = len(sampled)
             invalidate(state, "analysis")
             save_state(directory, state)
             st.rerun()
@@ -203,9 +207,13 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
     if "analysis" not in state:
         return
     analysis = Analysis.model_validate(state["analysis"]).check_duration(info.duration)
-    profile_current = state.get("analysis_profile") == digest(profile.model_dump())
-    if not profile_current:
+    rules_current = state.get("analysis_profile") == digest(profile.model_dump())
+    sampling_current = state.get("analysis_settings") == analysis_settings()
+    profile_current = rules_current and sampling_current
+    if not rules_current:
         st.warning("Профиль изменён. Повторите анализ перед созданием сценария; прежние результаты сохранены.")
+    if not sampling_current:
+        st.warning("Сохранённый анализ выполнен по старым настройкам. Нажмите «Проанализировать видео», чтобы использовать GPT-6 Luna и 5 кадров/с. Прежние тексты и файлы пока сохранены.")
     with st.expander("Проверить / исправить события", expanded=not bool(state.get("script"))):
         for note in analysis.notes:
             st.info(note)
@@ -312,7 +320,7 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
             st.error(str(exc))
     st.download_button("Скачать сценарий TXT", script.plain_text(), "script.txt")
     st.download_button("Скачать сценарий JSON", script.model_dump_json(indent=2), "script.json")
-    if script.language != "ru-RU" and st.button("Показать перевод на русский", disabled=not api.openai_key or dirty):
+    if script.language != "ru-RU" and st.button("Показать перевод на русский", disabled=not api.openai_key or dirty or not profile_current):
         try:
             state["translation"] = translate(api, script, "ru-RU", analysis, profile, text_model, cache).model_dump()
             save_state(directory, state)
@@ -328,7 +336,7 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
         voice_script = script
     else:
         st.info(f"Для озвучки выбран {voice_language}. Подготовьте и проверьте перевод.")
-        if st.button("Подготовить текст озвучки", disabled=not api.openai_key or dirty or not language_current):
+        if st.button("Подготовить текст озвучки", disabled=not api.openai_key or dirty or not language_current or not profile_current):
             try:
                 result = translate(api, script, voice_language, analysis, profile, text_model, cache)
                 state["voice_script"] = result.model_dump()

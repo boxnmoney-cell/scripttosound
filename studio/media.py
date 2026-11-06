@@ -2,10 +2,13 @@ import base64
 import json
 import math
 import subprocess
+import tempfile
 from pathlib import Path
 
+from .config import FRAME_EXTRACTION_VERSION, FRAME_RATE
 from .models import Script, VideoInfo
 from .performance import speech_window
+from .storage import read_json, save_json
 
 
 def run(args, timeout=180):
@@ -43,29 +46,51 @@ def duration(path: Path):
     return value
 
 
-def frames(path: Path, output: Path, video_duration: float, fps=1.0,
-           start=0.0, end=None, max_frames=240):
-    end = min(video_duration, end if end is not None else video_duration)
-    if not 0 <= start < end:
-        raise ValueError("Некорректный интервал анализа")
-    # Bounded sampling; the UI reports actual count and requested interval.
-    rate = min(fps, max_frames / (end - start))
-    times = [round(start + i / rate, 3) for i in range(max(1, math.ceil((end - start) * rate)))]
-    times += [max(start, end - 0.08)]
-    times = sorted(set(t for t in times if t < end))
-    output.mkdir(parents=True, exist_ok=True)
-    result = []
-    for t in times:
-        target = output / f"{t:.3f}.jpg"
-        if not target.exists():
-            run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", str(t),
-                 "-i", str(path), "-frames:v", "1", "-vf",
-                 "scale=960:960:force_original_aspect_ratio=decrease", "-q:v", "3", str(target)])
-        if target.exists() and target.stat().st_size:
-            result.append({"time": t, "path": target})
-    if not result:
-        raise ValueError("Не удалось извлечь кадры")
-    return result
+def sample_times(video_duration: float):
+    """One sample every 200 ms, including a partial last second; never thin the grid."""
+    if not math.isfinite(video_duration) or not 0 < video_duration <= 600:
+        raise ValueError("Длительность видео должна быть от 0 до 600 секунд")
+    count = math.ceil(video_duration * FRAME_RATE - 1e-9)
+    return [round(i / FRAME_RATE, 3) for i in range(max(1, count))]
+
+
+def frames(path: Path, output: Path, video_duration: float):
+    """Extract the complete 5 fps sequence in one FFmpeg pass before any API calls."""
+    times = sample_times(video_duration)
+    source = path.stat()
+    signature = {"version": FRAME_EXTRACTION_VERSION, "fps": FRAME_RATE,
+                 "duration": video_duration, "count": len(times),
+                 "source_size": source.st_size, "source_mtime_ns": source.st_mtime_ns}
+    # Isolate the new sequence from sparse frames produced by older releases.
+    target = output / FRAME_EXTRACTION_VERSION
+    target.mkdir(parents=True, exist_ok=True)
+    manifest = target / "manifest.json"
+    names = [f"frame_{i + 1:06d}.jpg" for i in range(len(times))]
+    try:
+        valid = read_json(manifest) == signature
+    except (ValueError, OSError):
+        valid = False
+    valid = valid and all((target / name).is_file() and (target / name).stat().st_size > 0 for name in names)
+    if not valid:
+        # A failed extraction must never be mistaken for a completed sequence.
+        manifest.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".extract-", dir=target) as tmp:
+            staging = Path(tmp)
+            filters = (f"setpts=PTS-STARTPTS,fps=fps={FRAME_RATE}:start_time=0:round=up:eof_action=pass,"
+                       "scale=w='min(iw,960)':h='min(ih,960)':force_original_aspect_ratio=decrease")
+            run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+                 "-map", "0:v:0", "-an", "-sn", "-vf", filters, "-fps_mode", "passthrough",
+                 "-frames:v", str(len(times)), "-q:v", "3", "-start_number", "1",
+                 str(staging / "frame_%06d.jpg")], timeout=600)
+            extracted = list(staging.glob("frame_*.jpg"))
+            if len(extracted) != len(times) or not all((staging / name).is_file() and
+                                                        (staging / name).stat().st_size > 0 for name in names):
+                raise ValueError(f"Извлечено {len(extracted)} кадров вместо {len(times)}. "
+                                 "Анализ не запущен: последовательность 5 кадров/с должна быть полной.")
+            for name in names:
+                (staging / name).replace(target / name)
+            save_json(manifest, signature)
+    return [{"time": time, "path": target / name} for time, name in zip(times, names)]
 
 
 def image_url(path: Path):

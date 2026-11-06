@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from .config import ANALYSIS_BATCH_SIZE, ANALYSIS_OVERLAP
 from .media import image_url
 from .models import Analysis, DirectionPlan, Observation, PerformanceSettings, Review, Script
 from .performance import DIRECTION_RULES
@@ -20,16 +21,18 @@ provided video duration. Source must be 'video'."""
 
 
 def analyze(api, profile, frames, duration, model, cache: Path, progress=lambda x: None):
+    if not frames:
+        raise ValueError("Нет кадров для анализа")
     observations = []
-    for offset in range(0, len(frames), 8):
-        batch = frames[max(0, offset - 2):offset + 8]
+    for offset in range(0, len(frames), ANALYSIS_BATCH_SIZE):
+        batch = frames[max(0, offset - ANALYSIS_OVERLAP):offset + ANALYSIS_BATCH_SIZE]
         content = [{"type": "text", "text": json.dumps({"duration": duration,
                     "current_interval": [batch[0]["time"], batch[-1]["time"]],
                     "previous_observations_for_identity_only": observations[-1:]}, ensure_ascii=False)}]
         for frame in batch:
             content += [{"type": "text", "text": f"Actual frame time: {frame['time']:.3f}s"},
                         {"type": "image_url", "image_url": {"url": image_url(frame["path"]), "detail": "high"}}]
-        progress(f"Анализ кадров {offset + 1}–{min(offset + 8, len(frames))} из {len(frames)}")
+        progress(f"Анализ кадров {offset + 1}–{min(offset + ANALYSIS_BATCH_SIZE, len(frames))} из {len(frames)}")
         result = api.structured(model, VISION_BASE + "\n" + profile.vision_rules,
                                 content, Observation, cache)
         for event in result.events:

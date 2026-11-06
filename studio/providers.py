@@ -4,6 +4,7 @@ from pathlib import Path
 
 import httpx
 
+from .config import OPENAI_MODEL
 from .storage import digest, read_json, save_json
 
 
@@ -44,6 +45,8 @@ class Providers:
         raise APIError("Запрос не завершён")
 
     def structured(self, model, system, content, schema, cache: Path | None = None):
+        if model != OPENAI_MODEL:
+            raise ValueError(f"В приложении разрешена только модель {OPENAI_MODEL}")
         if not self.openai_key:
             raise APIError("Укажите OPENAI_API_KEY в .env или в настройках приложения.")
         system += "\nReturn one JSON object matching this schema exactly:\n" + json.dumps(schema.model_json_schema())

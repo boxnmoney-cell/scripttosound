@@ -5,7 +5,8 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from studio import media
-from studio.models import Analysis, Delivery, DirectionItem, DirectionPlan, Event, Review, Script, Segment
+from studio.config import OPENAI_MODEL, analysis_settings
+from studio.models import Analysis, Delivery, DirectionItem, DirectionPlan, Event, Observation, Review, Script, Segment
 from studio.profiles import PROFILES
 from studio.performance import voice_fingerprint
 from studio.storage import digest, save_json
@@ -15,9 +16,13 @@ def test_app_opens_without_api_keys_and_languages_are_independent(monkeypatch, t
     monkeypatch.setenv("SCRIPT_TO_SOUND_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_VISION_MODEL", "gpt-5.5")
+    monkeypatch.setenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=15).run()
     assert not app.exception
     assert app.title[0].value == "🎙️ Script to Sound"
+    model_field = next(t for t in app.text_input if t.label == "Модель анализа и текста")
+    assert model_field.value == OPENAI_MODEL and model_field.disabled
     script = next(s for s in app.selectbox if s.label == "Язык сценария")
     voice = next(s for s in app.selectbox if s.label == "Язык озвучки")
     script.select("English (US)")
@@ -47,6 +52,7 @@ def test_existing_project_can_export_and_stale_voice_cannot(monkeypatch, tmp_pat
     save_json(directory / "project.json", {"name": "UI fixture", "video": video.name,
               "profile_id": PROFILES[0].id, "info": media.video_info(video).model_dump(),
               "analysis": analysis.model_dump(), "analysis_profile": digest(PROFILES[0].model_dump()),
+              "analysis_settings": analysis_settings(),
               "script": script.model_dump(), "audio": {"path": audio.name,
               "fingerprint": fingerprint, "timing": [{"id": "S001", "start": 0, "end": 2}]}})
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=15)
@@ -75,6 +81,7 @@ def test_ui_directs_previews_and_reuses_audio_without_real_api(monkeypatch, tmp_
     requests = []
 
     def structured(self, model, system, content, schema, cache=None):
+        assert model == OPENAI_MODEL
         if schema is DirectionPlan:
             return DirectionPlan(segments=[DirectionItem(id="S001", delivery=Delivery(
                 emotion="amused", laugh=True, reason="Подтверждённый отскок"))])
@@ -106,6 +113,7 @@ def test_ui_directs_previews_and_reuses_audio_without_real_api(monkeypatch, tmp_
     save_json(directory / "project.json", {"name": "Direction fixture", "video": video.name,
               "profile_id": PROFILES[0].id, "info": media.video_info(video).model_dump(),
               "analysis": analysis.model_dump(), "analysis_profile": digest(PROFILES[0].model_dump()),
+              "analysis_settings": analysis_settings(),
               "script": script.model_dump()})
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=15)
     app.session_state["active_project"] = str(directory)
@@ -129,3 +137,64 @@ def test_ui_directs_previews_and_reuses_audio_without_real_api(monkeypatch, tmp_
     app.run()
     assert not app.exception
     assert not any(b.label == "Собрать MP4" for b in app.button)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg required")
+def test_ui_extracts_every_frame_before_analysis_and_rejects_old_analysis(monkeypatch, tmp_path):
+    from studio.providers import Providers
+    from studio.storage import read_json
+
+    monkeypatch.setenv("SCRIPT_TO_SOUND_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only")
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    directory = tmp_path / "projects" / "sampling"
+    directory.mkdir(parents=True)
+    video = directory / "source.mp4"
+    media.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=64x96:r=25:d=2", "-c:v", "libx264", str(video)])
+    info = media.video_info(video)
+    save_json(directory / "project.json", {"name": "Five fps fixture", "video": video.name,
+              "profile_id": PROFILES[0].id, "info": info.model_dump()})
+    requests = []
+
+    def structured(self, model, system, content, schema, cache=None):
+        assert model == "gpt-6-luna"
+        assert len(list((directory / "frames").rglob("frame_*.jpg"))) == 10
+        requests.append(schema)
+        if schema is Observation:
+            assert all(p["type"] in {"text", "image_url"} for p in content)
+            return Observation(events=[])
+        if schema is Analysis:
+            return Analysis(events=[Event(id="E001", start=0, end=.2, description="Синее поле",
+                             evidence="Тестовый кадр", confidence="confirmed")],
+                            outcome="unknown", outcome_evidence="Нет результата", notes=[])
+        if schema is Script:
+            return Script(language="pt-BR", segments=[Segment(id="S001", start=0, end=2, text="Uma tela azul.", event_ids=["E001"])])
+        assert schema is Review
+        return Review(issues=[])
+
+    monkeypatch.setattr(Providers, "structured", structured)
+    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=15)
+    app.session_state["active_project"] = str(directory)
+    app.run()
+    next(b for b in app.button if b.label == "Проанализировать видео").click()
+    app.run()
+    assert not app.exception
+    state = read_json(directory / "project.json")
+    assert state["analysis_frame_count"] == 10
+    assert state["analysis_settings"] == analysis_settings()
+    assert requests == [Observation, Observation, Analysis]
+    next(b for b in app.button if b.label == "Создать новый вариант").click()
+    app.run()
+    assert not app.exception
+    assert requests[-2:] == [Script, Review]
+    state = read_json(directory / "project.json")
+    state.pop("analysis_settings")  # A project produced before the fixed 5fps policy.
+    save_json(directory / "project.json", state)
+    before = len(requests)
+    app.run()
+    assert not app.exception
+    assert any("по старым настройкам" in w.value for w in app.warning)
+    assert next(b for b in app.button if b.label == "Создать новый вариант").disabled
+    assert not next(b for b in app.button if b.label == "Проанализировать видео").disabled
+    assert len(requests) == before
+    assert read_json(directory / "project.json")["script"] == state["script"]

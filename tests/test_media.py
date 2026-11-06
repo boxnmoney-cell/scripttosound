@@ -3,7 +3,7 @@ import shutil
 import pytest
 
 from studio import media
-from studio.models import Script, Segment
+from studio.models import Delivery, Script, Segment
 
 
 pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg required")
@@ -55,3 +55,20 @@ def test_multiple_fragments_keep_their_positions(tmp_path):
     assert not any(samples[rate:rate * 2])
     assert any(samples[rate * 2:rate * 2 + rate // 2])
     assert not any(samples[rate * 3:])
+
+
+def test_directed_pause_is_real_silence_and_leaves_video_length_intact(tmp_path):
+    import array
+    speech = tmp_path / "tone.wav"
+    media.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=duration=0.5", str(speech)])
+    segment = Segment(id="S001", start=0, end=2, text="Olha!", event_ids=["E001"],
+                      delivery=Delivery(pause_before_ms=300, reason="Пауза перед видимым поворотом"))
+    script = Script(language="pt-BR", segments=[segment])
+    output = tmp_path / "pause.wav"
+    timing = media.assemble_voice([speech], script, output, 2)
+    samples = array.array("h", media.run(["ffmpeg", "-v", "error", "-i", str(output), "-ac", "1", "-f", "s16le", "-"]))
+    assert not any(samples[:int(44100 * .29)])
+    assert any(samples[int(44100 * .31):int(44100 * .8)])
+    assert media.duration(output) == pytest.approx(2, abs=.01)
+    assert timing[0]["start"] == .3
+    assert "00:00:00,300 --> 00:00:00,800" in media.srt(script, timing)

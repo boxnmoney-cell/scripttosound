@@ -2,7 +2,8 @@ import json
 from pathlib import Path
 
 from .media import image_url
-from .models import Analysis, Observation, Review, Script
+from .models import Analysis, DirectionPlan, Observation, PerformanceSettings, Review, Script
+from .performance import DIRECTION_RULES
 from .profiles import COMMON_RULES
 
 
@@ -55,28 +56,34 @@ Keep every confirmed major event; compress routine repeated movement.""",
 
 
 def review(api, script, analysis, profile, model, cache):
-    return api.structured(model, COMMON_RULES + "\n" + profile.writing_rules + """
+    return api.structured(model, COMMON_RULES + "\n" + profile.writing_rules + "\n" + DIRECTION_RULES + """
 Audit the proposed narration against the confirmed evidence and requested language.
 Return concrete issues only: unsupported claims, wrong event chronology/timing,
 misstated amounts/cashout, language errors, empty filler, duplicate lines or misleading
-financial promises. Event IDs alone do not prove the text. Check the text itself.
+financial promises, unmotivated laughter, excessive emotional accents, or acting
+that contradicts an event (e.g. relief before danger resolves). Check delivery.reason
+against the confirmed event. Event IDs alone do not prove the text. Check the text itself.
 An empty issues array means no issue found, not guaranteed correctness.""",
                          json.dumps({"facts": analysis.model_dump(), "script": script.model_dump()}, ensure_ascii=False),
                          Review, cache)
 
 
 def write_script(api, analysis, duration, profile, language, style, perspective,
-                 model, cache, revision="", previous=None, variation=0):
+                 model, cache, revision="", previous=None, variation=0, performance=None):
     confirmed = [e for e in analysis.events if e.confidence == "confirmed"]
     if not confirmed:
         raise ValueError("Нет подтверждённых событий. Уточните анализ.")
     perspective_id = "first_person" if perspective.startswith("Мой собственный") else "observer"
+    performance = performance or PerformanceSettings()
     context = {"facts": analysis.model_dump(), "duration": duration, "language": language,
                "style": style, "perspective": perspective_id, "revision": revision,
-               "previous": previous.model_dump() if previous else None, "variation": variation}
-    system = COMMON_RULES + "\n" + profile.writing_rules + """
-Return a Script. Language and perspective must match the requested settings exactly. Give segments
-unique IDs S001 etc., ordered non-overlapping start/end times within video duration.
+               "previous": previous.model_dump() if previous else None, "variation": variation,
+               "performance": performance.model_dump()}
+    system = COMMON_RULES + "\n" + profile.writing_rules + "\n" + DIRECTION_RULES + """
+Return a Script. Language, perspective and top-level performance must match the requested settings.
+Give every segment a unique ID (S001 etc.), ordered non-overlapping start/end times within
+video duration, and an explicit delivery object with appropriate emotion, laugh,
+laugh_position, pause_before_ms and a Russian explanation in reason.
 Every segment must reference at least one CONFIRMED event ID and describe that event
 near its real time. Prefer coherent 5–12 second speech blocks with short sentences,
 allowing pauses. Do not pack every event into the first block. Never invent filler
@@ -90,6 +97,8 @@ Respect revision requests only when compatible with the factual rules."""
             raise ValueError("Модель вернула другой язык сценария")
         if candidate.perspective != perspective_id:
             raise ValueError("Модель изменила выбранное лицо повествования")
+        if candidate.performance != performance:
+            raise ValueError("Модель изменила настройки эмоциональности")
         candidate.check(analysis, duration)
         check = review(api, candidate, analysis, profile, model, cache)
         if not check.issues:
@@ -99,9 +108,39 @@ Respect revision requests only when compatible with the factual rules."""
     raise ValueError("Сценарий требует исправления: " + "; ".join(last_issues[:5]))
 
 
+def direct_script(api, source, analysis, duration, profile, performance, model, cache):
+    """Change acting directions only; the model cannot rewrite words or timestamps."""
+    context = {"script": source.model_dump(), "facts": analysis.model_dump(),
+               "performance": performance.model_dump(), "duration": duration}
+    issues = []
+    for _ in range(2):
+        plan = api.structured(model, COMMON_RULES + "\n" + profile.writing_rules + "\n" + DIRECTION_RULES + """
+Assign delivery to the EXISTING script without rewriting any words or times.
+Return only a DirectionPlan, with one delivery for every original segment ID in
+the same order. The app applies it to the original script. Do not create extra IDs.
+If a phrase has no emotional justification, keep it neutral.""",
+                              json.dumps(context, ensure_ascii=False), DirectionPlan, cache)
+        if [item.id for item in plan.segments] != [s.id for s in source.segments]:
+            raise ValueError("План эмоций изменил состав или порядок реплик")
+        candidate = source.model_copy(deep=True)
+        candidate.performance = performance
+        for segment, item in zip(candidate.segments, plan.segments):
+            segment.delivery = item.delivery
+        try:
+            candidate = Script.model_validate(candidate.model_dump()).check(analysis, duration)
+            issues = review(api, candidate, analysis, profile, model, cache).issues
+        except ValueError as exc:
+            issues = [str(exc)]
+        if not issues:
+            return candidate
+        context.update(previous_plan=plan.model_dump(), required_corrections=issues)
+    raise ValueError("План эмоций требует исправления: " + "; ".join(issues[:5]))
+
+
 def translate(api, source, language, analysis, profile, model, cache):
     result = api.structured(model, COMMON_RULES + """
-Translate narration idiomatically into the requested locale. Keep perspective and all segment IDs,
+Translate narration idiomatically into the requested locale. Keep performance settings,
+all delivery fields (including their Russian reasons), perspective and all segment IDs,
 start/end times and event_ids EXACTLY unchanged. Do not add, omit or alter gameplay
 facts, monetary amounts, outcome or point of view. Preserve short spoken delivery.
 Set language to the requested locale. Output the same Script structure.""",
@@ -112,6 +151,10 @@ Set language to the requested locale. Output the same Script structure.""",
     for a, b in zip(source.segments, result.segments):
         if (a.id, a.start, a.end, a.event_ids) != (b.id, b.start, b.end, b.event_ids):
             raise ValueError("Перевод изменил время или привязку к событиям")
+        if a.delivery != b.delivery:
+            raise ValueError("Перевод изменил эмоции или паузы")
+    if result.performance != source.performance:
+        raise ValueError("Перевод изменил настройки эмоциональности")
     check = review(api, result, analysis, profile, model, cache)
     if check.issues:
         raise ValueError("Проверьте перевод: " + "; ".join(check.issues[:5]))

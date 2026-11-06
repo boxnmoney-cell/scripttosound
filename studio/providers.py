@@ -80,6 +80,17 @@ class Providers:
     def models(self):
         return [m for m in self.eleven_get("/v1/models") if m.get("can_do_text_to_speech")]
 
+    def validate_speech(self, voice_id, model_id, language):
+        if not voice_id.isalnum():
+            raise ValueError("Некорректный Voice ID")
+        selected = next((m for m in self.models() if m["model_id"] == model_id), None)
+        if selected is None:
+            raise ValueError("Модель не найдена среди доступных моделей синтеза. Обновите список.")
+        supported = {item["language_id"] for item in selected.get("languages", [])}
+        if supported and language.split("-")[0] not in supported and language not in supported:
+            raise ValueError("Модель не заявляет поддержку языка озвучки. Выберите другую модель.")
+        self.eleven_get("/v1/voices/" + voice_id)
+
     def speech(self, text, voice_id, model_id, cache: Path):
         if not self.eleven_key:
             raise APIError("Не указан ключ ElevenLabs")

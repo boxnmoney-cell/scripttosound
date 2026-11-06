@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from .models import Script, VideoInfo
+from .performance import speech_window
 
 
 def run(args, timeout=180):
@@ -79,18 +80,19 @@ def assemble_voice(parts, script: Script, output: Path, total_duration: float):
     filters, labels, report = [], [], []
     for i, (path, segment) in enumerate(zip(parts, script.segments)):
         actual = duration(path)
-        window = segment.end - segment.start
+        window = speech_window(segment)
         ratio = actual / window
         if ratio > 1.12:
             raise ValueError(f"Реплика {segment.id}: {actual:.1f} с при окне {window:.1f} с. "
                              "Сократите эту реплику или расширьте её интервал.")
         args += ["-i", str(path)]
         tempo = max(1.0, ratio)
-        delay = round(segment.start * 1000)
+        speech_start = segment.start + segment.delivery.pause_before_ms / 1000
+        delay = round(speech_start * 1000)
         filters.append(f"[{i}:a]atempo={tempo:.8f},adelay={delay}:all=1[a{i}]")
         labels.append(f"[a{i}]")
         report.append({"id": segment.id, "original_seconds": actual, "tempo": tempo,
-                       "start": segment.start, "end": min(segment.end, segment.start + actual / tempo)})
+                       "start": speech_start, "end": min(segment.end, speech_start + actual / tempo)})
     mix = f"amix=inputs={len(parts)}:normalize=0," if len(parts) > 1 else ""
     filters.append("".join(labels) + mix + f"apad=whole_dur={total_duration}[out]")
     args += ["-filter_complex", ";".join(filters), "-map", "[out]", "-t", str(total_duration), "-ar", "44100",

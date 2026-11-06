@@ -56,9 +56,9 @@ def list_projects(root: Path):
 
 def invalidate(state, stage):
     stages = {
-        "analysis": ["script", "voice_script", "translation", "audio", "export"],
-        "script": ["voice_script", "translation", "audio", "export"],
-        "voice_script": ["audio", "export"],
+        "analysis": ["script", "voice_script", "translation", "preview", "audio", "export"],
+        "script": ["voice_script", "translation", "preview", "audio", "export"],
+        "voice_script": ["preview", "audio", "export"],
         "audio": ["export"],
     }
     for key in stages[stage]:

@@ -8,8 +8,9 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from studio import media
-from studio.models import Analysis, LANGUAGES, Profile, Script
-from studio.pipeline import analyze, review, translate, write_script
+from studio.models import Analysis, LANGUAGES, PerformanceSettings, Profile, Script
+from studio.pipeline import analyze, direct_script, review, translate, write_script
+from studio.performance import EMOTIONS, INTENSITIES, POSITIONS, automatic_audio_tags, speech_window, tts_text, voice_fingerprint
 from studio.profiles import COMMON_RULES, PROFILES
 from studio.providers import Providers
 from studio.storage import digest, invalidate, list_projects, project_for_upload, read_json, save_json
@@ -26,12 +27,33 @@ def save_state(directory, state):
 
 def script_rows(script):
     return [{"id": s.id, "start": s.start, "end": s.end,
-             "text": s.text, "event_ids": ", ".join(s.event_ids)} for s in script.segments]
+             "text": s.text, "emotion": EMOTIONS[s.delivery.emotion],
+             "laugh": s.delivery.laugh, "laugh_position": POSITIONS[s.delivery.laugh_position],
+             "pause_before_ms": s.delivery.pause_before_ms, "reason": s.delivery.reason,
+             "event_ids": ", ".join(s.event_ids)} for s in script.segments]
 
 
-def rows_script(rows, language, perspective="observer"):
-    return Script(language=language, perspective=perspective, segments=[{**row, "event_ids": [v.strip() for v in row["event_ids"].split(",") if v.strip()]}
-                                              for row in rows])
+def rows_script(rows, language, perspective="observer", performance=None):
+    emotions = {v: k for k, v in EMOTIONS.items()}
+    positions = {v: k for k, v in POSITIONS.items()}
+    segments = []
+    for row in rows:
+        segments.append({"id": row["id"], "start": row["start"], "end": row["end"], "text": row["text"],
+                         "event_ids": [v.strip() for v in row["event_ids"].split(",") if v.strip()],
+                         "delivery": {"emotion": emotions[row["emotion"]], "laugh": row["laugh"],
+                                      "laugh_position": positions[row["laugh_position"]],
+                                      "pause_before_ms": row["pause_before_ms"], "reason": row["reason"]}})
+    return Script(language=language, perspective=perspective,
+                  performance=performance or PerformanceSettings(), segments=segments)
+
+
+def script_columns():
+    return {"text": st.column_config.TextColumn("Реплика", width="large"),
+            "emotion": st.column_config.SelectboxColumn("Эмоция", options=list(EMOTIONS.values()), required=True),
+            "laugh": st.column_config.CheckboxColumn("Короткий смех"),
+            "laugh_position": st.column_config.SelectboxColumn("Когда смеяться", options=list(POSITIONS.values()), required=True),
+            "pause_before_ms": st.column_config.NumberColumn("Пауза перед, мс", min_value=0, max_value=800, step=50, required=True),
+            "reason": st.column_config.TextColumn("Почему здесь", width="medium")}
 
 
 def main():
@@ -219,6 +241,13 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
 
     st.subheader("2. Сценарий")
     style = st.selectbox("Подача", ["Естественный комментарий", "Спокойный рассказ", "Эмоциональный комментарий"])
+    saved_performance = PerformanceSettings.model_validate(state.get("script", {}).get("performance", {}))
+    intensity = st.selectbox("Сила эмоций", list(INTENSITIES), index=list(INTENSITIES).index(saved_performance.intensity),
+                             format_func=INTENSITIES.get, key="intensity_" + directory.name)
+    allow_laughter = st.checkbox("Разрешить уместный короткий смех", value=saved_performance.allow_laughter,
+                                 key="laughter_" + directory.name)
+    performance = PerformanceSettings(intensity=intensity, allow_laughter=allow_laughter)
+    st.caption("Смех не обязателен. GPT привязывает эмоции к подтверждённым событиям, оставляет спокойные участки и убирает пустые фразы.")
     perspective = st.selectbox("От чьего лица", ["Наблюдатель", "Мой собственный раунд — от первого лица"])
     revision = st.text_input("Пожелание к тексту", placeholder="Например: короче начало, меньше восклицаний")
     col1, col2 = st.columns(2)
@@ -235,7 +264,7 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
                 else:
                     result = write_script(api, analysis, info.duration, profile, script_language,
                                           style, perspective, text_model, cache, revision, old_script,
-                                          state.get("variation", 0))
+                                          state.get("variation", 0), performance=performance)
                 result.check(analysis, info.duration)
             invalidate(state, "script")
             state["script"] = result.model_dump()
@@ -248,17 +277,32 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
         return
     script = Script.model_validate(state["script"])
     language_current = script.language == script_language
+    performance_current = script.performance == performance
+    if not performance_current:
+        st.info("Настройки эмоций изменены. Создайте новый вариант или нажмите «Расставить эмоции, сохранив текст».")
     st.caption("Язык сохранённого сценария: " + script.language)
     if not language_current:
         st.info("Выбран другой язык. Переведите существующий сценарий или создайте новый вариант.")
     edited_rows = st.data_editor(script_rows(script), disabled=["id"], num_rows="fixed", width="stretch",
-                                key="script_" + digest(state["script"]), column_config={"text": st.column_config.TextColumn("Реплика", width="large")})
+                                key="script_" + digest(state["script"]), column_config=script_columns())
+    st.caption("У каждой реплики можно изменить эмоцию, смех и паузу. В «Почему здесь» укажите событие, объясняющее акцент. В самом тексте пометки не нужны.")
     dirty = edited_rows != script_rows(script)
     if dirty:
         st.info("Есть несохранённые правки. Сохраните их перед озвучкой.")
     if st.button("Сохранить текст и время реплик"):
         try:
-            updated = rows_script(edited_rows, script.language, script.perspective).check(analysis, info.duration)
+            updated = rows_script(edited_rows, script.language, script.perspective, script.performance).check(analysis, info.duration)
+            if updated.model_dump() != state["script"]:
+                invalidate(state, "script")
+                state["script"] = updated.model_dump()
+                save_state(directory, state)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if st.button("Расставить эмоции, сохранив текст", disabled=not api.openai_key or dirty or not profile_current or not language_current):
+        try:
+            with st.spinner("Подбираю эмоции и проверяю их уместность…"):
+                updated = direct_script(api, script, analysis, info.duration, profile, performance, text_model, cache)
             if updated.model_dump() != state["script"]:
                 invalidate(state, "script")
                 state["script"] = updated.model_dump()
@@ -298,11 +342,11 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
             return
         voice_script = Script.model_validate(raw_voice)
         voice_rows = st.data_editor(script_rows(voice_script), disabled=["id", "start", "end", "event_ids"],
-                                    width="stretch", key="voicetext_" + digest(raw_voice))
+                                    width="stretch", key="voicetext_" + digest(raw_voice), column_config=script_columns())
         dirty_voice = voice_rows != script_rows(voice_script)
         if st.button("Сохранить текст озвучки"):
             try:
-                updated = rows_script(voice_rows, voice_language, voice_script.perspective).check(analysis, info.duration)
+                updated = rows_script(voice_rows, voice_language, voice_script.perspective, voice_script.performance).check(analysis, info.duration)
                 if updated.model_dump() != state["voice_script"]:
                     state["voice_script"] = updated.model_dump()
                     invalidate(state, "voice_script")
@@ -311,34 +355,59 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
             except Exception as exc:
                 st.error(str(exc))
         dirty = dirty or dirty_voice
-    fingerprint = digest({"script": voice_script.model_dump(), "voice": voice_id, "model": tts_model})
+    use_tags = st.toggle("Передавать эмоции и смех в ElevenLabs", value=automatic_audio_tags(tts_model), key="audio_tags_" + tts_model)
+    if use_tags and not automatic_audio_tags(tts_model):
+        st.warning("Поддержка аудиотегов этой моделью не подтверждена. Сначала прослушайте пробу. Если пометки читаются вслух, отключите их или выберите eleven_v3.")
+    elif not use_tags and any(s.delivery.laugh or s.delivery.emotion != "neutral" for s in voice_script.segments):
+        st.info("Аудиотеги выключены: текст и паузы сохранятся, но явные команды эмоций и смеха не передадутся. Автоматически теги включаются для eleven_v3.")
+    fingerprint = voice_fingerprint(voice_script, voice_id, tts_model, use_tags)
+    rendered = {s.id: tts_text(s, use_tags) for s in voice_script.segments}
+    with st.expander("Текст, который получит ElevenLabs"):
+        for segment in voice_script.segments:
+            st.text(f"{segment.id} · {segment.start:.2f}–{segment.end:.2f} с\n{rendered[segment.id]}")
+        st.caption("Пометки синтеза не попадают в обычный TXT и субтитры. Реакция конкретного голоса на теги требует прослушивания.")
+        st.download_button("Скачать текст для ElevenLabs", "\n\n".join(rendered.values()), "elevenlabs_script.txt")
     st.caption(f"Синтез: {voice_language} · {len(voice_script.segments)} реплик. Оплачиваются запросы ElevenLabs; неизменённые фрагменты берутся из кэша.")
-    if st.button("Создать озвучку", disabled=dirty or not language_current or not profile_current or not api.eleven_key or not api.openai_key or not voice_id or not tts_model, type="primary"):
+    can_synthesize = not dirty and language_current and performance_current and profile_current and bool(api.eleven_key and api.openai_key and voice_id and tts_model)
+
+    def validate_synthesis():
+        voice_script.check(analysis, info.duration)
+        issues = review(api, voice_script, analysis, profile, text_model, cache).issues
+        if issues:
+            raise ValueError("Исправьте текст или подачу: " + "; ".join(issues))
+        api.validate_speech(voice_id, tts_model, voice_script.language)
+
+    preview_segment = st.selectbox("Пробная реплика", voice_script.segments,
+                                    format_func=lambda s: f"{s.id} · {EMOTIONS[s.delivery.emotion]} · {s.text[:80]}")
+    preview_key = digest({"fingerprint": fingerprint, "id": preview_segment.id})
+    if st.button("Прослушать одну реплику", disabled=not can_synthesize):
+        try:
+            with st.spinner("Готовлю пробную озвучку…"):
+                validate_synthesis()
+                part = api.speech(rendered[preview_segment.id], voice_id, tts_model, directory / "tts_cache")
+                seconds = media.duration(part)
+            state["preview"] = {"key": preview_key, "path": str(part.relative_to(directory)), "duration": seconds}
+            save_state(directory, state)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if state.get("preview", {}).get("key") == preview_key and not dirty and performance_current:
+        st.audio(str(directory / state["preview"]["path"]))
+        st.caption("Проба — одна реплика без тишины перед ней. Указанная пауза добавится при сборке полного ролика.")
+        if state["preview"]["duration"] > speech_window(preview_segment) * 1.12:
+            st.warning("Проба длиннее доступного интервала. Сократите текст, уберите смех или расширьте время реплики.")
+    if st.button("Создать озвучку", disabled=not can_synthesize, type="primary"):
         try:
             with st.spinner("Проверяю текст, голос и модель…"):
-                voice_script.check(analysis, info.duration)
-                issues = review(api, voice_script, analysis, profile, text_model, cache).issues
-                if issues:
-                    raise ValueError("Исправьте текст: " + "; ".join(issues))
-                models = api.models()
-                selected_model = next((m for m in models if m["model_id"] == tts_model), None)
-                if selected_model is None:
-                    raise ValueError("Эта модель не найдена среди доступных моделей синтеза. Обновите список.")
-                supported = {item["language_id"] for item in selected_model.get("languages", [])}
-                if supported and voice_language.split("-")[0] not in supported and voice_language not in supported:
-                    raise ValueError("Выбранная модель не заявляет поддержку языка озвучки. Выберите другую модель.")
-                # A voice name is not an ID. Check the actual ID before paid synthesis.
-                if not voice_id.isalnum():
-                    raise ValueError("Некорректный Voice ID")
-                api.eleven_get("/v1/voices/" + voice_id)
+                validate_synthesis()
             parts = []
             status = st.empty()
             for i, segment in enumerate(voice_script.segments, 1):
                 status.info(f"Озвучка {i}/{len(voice_script.segments)}: {segment.id}")
-                part = api.speech(segment.text, voice_id, tts_model, directory / "tts_cache")
+                part = api.speech(rendered[segment.id], voice_id, tts_model, directory / "tts_cache")
                 # Stop at the first overlong fragment, before paying for later ones.
                 actual = media.duration(part)
-                if actual > (segment.end - segment.start) * 1.12:
+                if actual > speech_window(segment) * 1.12:
                     raise ValueError(f"Реплика {segment.id} длится {actual:.1f} с. Сократите её или расширьте интервал. "
                                      "Уже созданные фрагменты сохранены в кэше.")
                 parts.append(part)
@@ -351,7 +420,7 @@ def run_project(api, profiles, custom_profiles, script_language, voice_language,
         except Exception as exc:
             st.error(str(exc))
     audio = state.get("audio")
-    current_audio = audio and audio["fingerprint"] == fingerprint and not dirty and language_current and profile_current
+    current_audio = audio and audio["fingerprint"] == fingerprint and not dirty and language_current and profile_current and performance_current
     if audio and not current_audio:
         st.warning("Текст, язык, голос или модель изменились. Для экспорта нужна актуальная озвучка.")
     if not current_audio:

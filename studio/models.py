@@ -1,6 +1,8 @@
+import math
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Model(BaseModel):
@@ -51,29 +53,72 @@ class Analysis(Model):
         return self
 
 
+class Delivery(Model):
+    emotion: Literal["neutral", "tense", "surprised", "excited", "amused", "relieved", "disappointed"] = "neutral"
+    laugh: bool = False
+    laugh_position: Literal["before", "after"] = "after"
+    pause_before_ms: int = Field(default=0, ge=0, le=800)
+    reason: str = ""
+
+    @model_validator(mode="after")
+    def grounded(self):
+        if (self.emotion != "neutral" or self.laugh or self.pause_before_ms) and not self.reason.strip():
+            raise ValueError("Укажите событие, которое объясняет эмоцию, смех или паузу")
+        if self.laugh and self.emotion in {"tense", "disappointed"}:
+            raise ValueError("Разделите смех и напряжение/разочарование на разные реплики")
+        return self
+
+
+class PerformanceSettings(Model):
+    intensity: Literal["restrained", "natural", "expressive"] = "natural"
+    allow_laughter: bool = True
+
+
+class DirectionItem(Model):
+    id: str
+    delivery: Delivery
+
+
+class DirectionPlan(Model):
+    segments: list[DirectionItem]
+
+
 class Segment(Model):
     id: str
     start: float = Field(ge=0)
     end: float = Field(gt=0)
     text: str = Field(min_length=1)
     event_ids: list[str] = Field(min_length=1)
+    delivery: Delivery = Field(default_factory=Delivery)
+
+    @field_validator("text")
+    @classmethod
+    def spoken_words_only(cls, value):
+        value = value.strip()
+        if not value or re.search(r"\[[^\]\n]*\]|<[^>\n]*>", value):
+            raise ValueError("В реплике нужен только произносимый текст. Эмоции задайте в отдельных полях.")
+        return value
 
     @model_validator(mode="after")
     def interval(self):
         if self.end <= self.start:
             raise ValueError("Реплика должна иметь положительную длительность")
+        if self.end - self.start - self.delivery.pause_before_ms / 1000 < 0.3:
+            raise ValueError("Пауза не оставляет достаточно времени для реплики")
         return self
 
 
 class Script(Model):
     language: str
     perspective: Literal["observer", "first_person"] = "observer"
+    performance: PerformanceSettings = Field(default_factory=PerformanceSettings)
     segments: list[Segment] = Field(min_length=1)
 
     def check(self, analysis: Analysis, duration: float):
         confirmed = {e.id for e in analysis.events if e.confidence == "confirmed"}
         used_ids = set()
         previous_end = 0.0
+        laughs = []
         for segment in self.segments:
             if segment.id in used_ids:
                 raise ValueError("Повторяющиеся ID реплик")
@@ -85,6 +130,16 @@ class Script(Model):
             if not segment.text.strip():
                 raise ValueError("Пустая реплика")
             previous_end = segment.end
+            if segment.delivery.laugh:
+                if not self.performance.allow_laughter:
+                    raise ValueError("Смех отключён в настройках сценария")
+                if segment.end - segment.start - segment.delivery.pause_before_ms / 1000 < 2:
+                    raise ValueError("Для смеха с репликой оставьте хотя бы две секунды")
+                laughs.append(segment.start)
+        if len(laughs) > min(2, max(1, math.ceil(duration / 60))):
+            raise ValueError("Слишком частый смех: максимум один раз в минутном ролике, два — в более длинном")
+        if any(b - a < 12 for a, b in zip(laughs, laughs[1:])):
+            raise ValueError("Между эпизодами смеха оставьте не менее 12 секунд")
         return self
 
     def plain_text(self):
